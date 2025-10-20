@@ -11,7 +11,7 @@ python \
            --bsz 100 \
            --nworker 16 \
            --backbone segman \
-           --feature_extractor_path "backbones/SegMAN_Encoder_b.pth.tar" \
+           --feature_extractor_path "backbones/SegMAN_Encoder_s.pth.tar" \
            --logpath "./logs" \
            --lr 1e-4 \
            --nepoch 500

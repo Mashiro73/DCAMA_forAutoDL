@@ -13,7 +13,18 @@ from .base.pvt import pvt_v2_b1_official
 from .base.segman_encoder import SegMANEncoder_s,SegMANEncoder_b
 from .base.swin_transformer_v2 import SwinTransformerV2
 from model.base.transformer import MultiHeadedAttention, PositionalEncoding
-
+try:
+    from .base.segman_dependencies.mmscope import MMSCopE
+    from .base.segman_dependencies.vssm_utils import LayerNorm2d # 如果聚合层需要
+    use_mmscope_flag = True
+    print("INFO: Modular MMSCopE imported successfully.")
+except ImportError as e:
+    print(f"\n\nWARNING: Could not import MMSCopE or its dependencies: {e}")
+    print("Falling back to original DCAMA fusion. Ensure all dependencies")
+    print("(especially compiled CUDA kernel for selective_scan) are correctly installed.\n\n")
+    use_mmscope_flag = False
+    MMSCopE = None # 定义一个占位符
+    LayerNorm2d = nn.LayerNorm # 简单回退
 
 class SpatialGatingUnit(nn.Module):
     """
@@ -85,17 +96,17 @@ class DCAMA(nn.Module):
         elif backbone == 'segman':
             # --- 实例化 SegMAN Encoder ---
             # 我们以 SegMANEncoder_s 为例。pretrained 参数会由 args.feature_extractor_path 传入
-            #self.feature_extractor = SegMANEncoder_s(pretrained=pretrained_path, image_size=224)
-            self.feature_extractor = SegMANEncoder_b(pretrained=pretrained_path, image_size=224)
+            self.feature_extractor = SegMANEncoder_s(pretrained=pretrained_path, image_size=224)
+            # self.feature_extractor = SegMANEncoder_b(pretrained=pretrained_path, image_size=224)
 
             # --- 配置模型参数 (这些值必须与 SegMANEncoder_s 的定义严格对应) ---
             # 根据 segman_encoder.py 中 SegMANEncoder_s 的定义:
             #embed_dims=[64, 144, 288, 512], depths=[2, 2, 10, 4]
-            # self.feat_channels = [64, 144, 288, 512]
-            # self.nlayers = [2, 2, 10, 4]
+            self.feat_channels = [64, 144, 288, 512]
+            self.nlayers = [2, 2, 10, 4]
 
-            self.feat_channels = [96, 160, 364, 560] # 必须与 _b 的 embed_dims 匹配
-            self.nlayers = [4, 4, 18, 4]             # 必须与 _b 的 depths 匹配
+            # self.feat_channels = [96, 160, 364, 560] # 必须与 _b 的 embed_dims 匹配
+            # self.nlayers = [4, 4, 18, 4]             # 必须与 _b 的 depths 匹配
 
             # 论文中提到使用 MMSegmentation 库训练，权重通常保存在 'state_dict_ema' 或 'state_dict'
             # 您的 segman_encoder.py 内部加载逻辑已经处理了 'state_dict_ema'
@@ -323,15 +334,26 @@ class DCAMA(nn.Module):
 
 
 class DCAMA_model(nn.Module):
-    def __init__(self, in_channels, stack_ids):
+    def __init__(self, in_channels, stack_ids,use_mmscope=True):
         super(DCAMA_model, self).__init__()
-
+        self.use_mmscope = use_mmscope
         self.stack_ids = stack_ids
+
+        # ✅ 严格匹配 SegMANEncoder 的 embed_dims
+        if use_mmscope:
+            # 为每个 stage 创建独立的 MMSCopE 模块
+            self.mmscope_modules = nn.ModuleList([
+                MMSCopE(embed_dim=ch) for ch in in_channels
+            ])
 
         # DCAMA blocks
         self.DCAMA_blocks = nn.ModuleList()
         self.pe = nn.ModuleList()
 
+        if len(in_channels) < 2:
+            raise ValueError("in_channels must contain dimensions for at least two stages (e.g., 1/4 and 1/8)")
+        d_model = in_channels[1]  # e.g., Swin-B: 256, SegMAN-S: 144
+        print(f"INFO: Determined d_model for DCAMA blocks and MMSCopE input: {d_model}")
         # for inch in in_channels[1:]:
         #     self.DCAMA_blocks.append(MultiHeadedAttention(h=8, d_model=inch, dropout=0.5))
         #     self.pe.append(PositionalEncoding(d_model=inch, dropout=0.5))
@@ -386,6 +408,27 @@ class DCAMA_model(nn.Module):
                                     nn.Conv2d(outch1, 2, (3, 3), padding=(1, 1), bias=True))
 
     def forward(self, query_feats, support_feats, support_mask, nshot=1):
+        if self.use_mmscope:
+            # ✅ 增强 query 特征 (每个 stage 独立)
+            enhanced_query_feats = []
+            for i, feat in enumerate(query_feats):
+                # feat: [B, C, H, W]
+                enhanced = self.mmscope_modules[i](feat)
+                enhanced_query_feats.append(enhanced)
+
+            # ✅ 增强 support 特征 (每个 stage 独立)
+            enhanced_support_feats = []
+            for i, feat in enumerate(support_feats):
+                B, n_shot, C, H, W = feat.shape
+                # reshape to [B*n_shot, C, H, W]
+                feat_flat = feat.view(B * n_shot, C, H, W)
+                enhanced_flat = self.mmscope_modules[i](feat_flat)
+                # reshape back
+                enhanced = enhanced_flat.view(B, n_shot, C, H, W)
+                enhanced_support_feats.append(enhanced)
+
+            query_feats = enhanced_query_feats
+            support_feats = enhanced_support_feats
         coarse_masks = []
         for idx, query_feat in enumerate(query_feats):
             # 1/4 scale feature only used in skip connect
