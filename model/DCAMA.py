@@ -1,3 +1,6 @@
+# 文件路径: model/DCAMA.py
+# 方案三：修改 DCAMA_model 以使用 MMSCopE 解码器
+
 r""" Dense Cross-Query-and-Support Attention Weighted Mask Aggregation for Few-Shot Segmentation """
 from functools import reduce
 from operator import add
@@ -14,15 +17,14 @@ from .base.segman_encoder import SegMANEncoder_s,SegMANEncoder_b
 from .base.swin_transformer_v2 import SwinTransformerV2
 from model.base.transformer import MultiHeadedAttention, PositionalEncoding
 try:
+    # ✅ [修改] 导入重构后的 MMSCopE
     from .base.segman_dependencies.mmscope import MMSCopE
     from .base.segman_dependencies.vssm_utils import LayerNorm2d # 如果聚合层需要
-    use_mmscope_flag = True
     print("INFO: Modular MMSCopE imported successfully.")
 except ImportError as e:
     print(f"\n\nWARNING: Could not import MMSCopE or its dependencies: {e}")
     print("Falling back to original DCAMA fusion. Ensure all dependencies")
     print("(especially compiled CUDA kernel for selective_scan) are correctly installed.\n\n")
-    use_mmscope_flag = False
     MMSCopE = None # 定义一个占位符
     LayerNorm2d = nn.LayerNorm # 简单回退
 
@@ -66,7 +68,7 @@ class SpatialGatingUnit(nn.Module):
 
 class DCAMA(nn.Module):
 
-    def __init__(self, backbone, pretrained_path, use_original_imgsize):
+    def __init__(self, backbone, pretrained_path, use_original_imgsize,use_mmscope=False):
         super(DCAMA, self).__init__()
 
         self.backbone = backbone
@@ -224,10 +226,14 @@ class DCAMA(nn.Module):
             raise Exception('Unavailable backbone: %s' % backbone)
         self.feature_extractor.eval()
 
-        # define model
         self.lids = reduce(add, [[i + 1] * x for i, x in enumerate(self.nlayers)])
         self.stack_ids = torch.tensor(self.lids).bincount()[-4:].cumsum(dim=0)
-        self.model = DCAMA_model(in_channels=self.feat_channels, stack_ids=self.stack_ids)
+        
+        # ✅ [修改] 将 self.lids 传递给 DCAMA_model
+        self.model = DCAMA_model(in_channels=self.feat_channels, 
+                                 stack_ids=self.stack_ids, 
+                                 lids=self.lids,  # 传递 lids
+                                 use_mmscope=use_mmscope)
 
         self.cross_entropy_loss = nn.CrossEntropyLoss()
 
@@ -334,17 +340,19 @@ class DCAMA(nn.Module):
 
 
 class DCAMA_model(nn.Module):
-    def __init__(self, in_channels, stack_ids,use_mmscope=True):
+    # ✅ [修改] 添加 lids 到 __init__ 签名
+    def __init__(self, in_channels, stack_ids, lids, use_mmscope=True):
         super(DCAMA_model, self).__init__()
         self.use_mmscope = use_mmscope
         self.stack_ids = stack_ids
+        self.lids = lids  # ✅ 存储 lids
 
-        # ✅ 严格匹配 SegMANEncoder 的 embed_dims
-        if use_mmscope:
-            # 为每个 stage 创建独立的 MMSCopE 模块
-            self.mmscope_modules = nn.ModuleList([
-                MMSCopE(embed_dim=ch) for ch in in_channels
-            ])
+        # # ✅ 严格匹配 SegMANEncoder 的 embed_dims
+        # if use_mmscope:
+        #     # 为每个 stage 创建独立的 MMSCopE 模块
+        #     self.mmscope_modules = nn.ModuleList([
+        #         MMSCopE(embed_dim=ch) for ch in in_channels
+        #     ])
 
         # DCAMA blocks
         self.DCAMA_blocks = nn.ModuleList()
@@ -376,11 +384,33 @@ class DCAMA_model(nn.Module):
             self.DCAMA_blocks.append(MultiHeadedAttention(h=current_h, d_model=inch, dropout=0.5))
             self.pe.append(PositionalEncoding(d_model=inch, dropout=0.5))
 
+       # ✅ [修改] 将解码器组件的定义移到前面
         outch1, outch2, outch3 = 16, 64, 128
-        self.fusion_gate1 = SpatialGatingUnit(in_channels=outch3)
-        self.fusion_gate2 = SpatialGatingUnit(in_channels=outch3)
 
-        # conv blocks
+        # ✅ [修改] 条件化地初始化解码器
+        # 根据 use_mmscope 标志，决定是初始化 MMSCopE 还是
+        # DCAMA 原始的 SpatialGatingUnit 解码器
+        if self.use_mmscope:
+            print("INFO: [方案三] 正在初始化 MMSCopE 作为解码器。")
+            # 1. 初始化 MMSCopE 解码器
+            #    embed_dim 必须匹配 conv1/2/3 的输出通道 outch3 (128)
+            self.mmscope_decoder = MMSCopE(embed_dim=outch3)
+            
+            # 2. 将原有的融合模块设为 None，它们将被替换
+            self.fusion_gate1 = None
+            self.fusion_gate2 = None
+            self.conv4 = None
+            self.conv5 = None
+        else:            
+            print("INFO: 正在初始化 DCAMA 原始的 SpatialGatingUnit 解码器。")
+            # 1. 初始化 DCAMA 原本的融合模块
+            self.mmscope_decoder = None
+            self.fusion_gate1 = SpatialGatingUnit(in_channels=outch3)
+            self.fusion_gate2 = SpatialGatingUnit(in_channels=outch3)
+            self.conv4 = self.build_conv_block(outch3, [outch3, outch3, outch3], [3, 3, 3], [1, 1, 1])
+            self.conv5 = self.build_conv_block(outch3, [outch3, outch3, outch3], [3, 3, 3], [1, 1, 1])
+
+        # conv blocks (用于生成 coarse_masks，保持不变)
         self.conv1 = self.build_conv_block(stack_ids[3] - stack_ids[2], [outch1, outch2, outch3], [3, 3, 3],
                                            [1, 1, 1])  # 1/32
         self.conv2 = self.build_conv_block(stack_ids[2] - stack_ids[1], [outch1, outch2, outch3], [5, 3, 3],
@@ -388,47 +418,21 @@ class DCAMA_model(nn.Module):
         self.conv3 = self.build_conv_block(stack_ids[1] - stack_ids[0], [outch1, outch2, outch3], [5, 5, 3],
                                            [1, 1, 1])  # 1/8
 
-        self.conv4 = self.build_conv_block(outch3, [outch3, outch3, outch3], [3, 3, 3], [1, 1, 1])  # 1/32 + 1/16
-        self.conv5 = self.build_conv_block(outch3, [outch3, outch3, outch3], [3, 3, 3], [1, 1, 1])  # 1/16 + 1/8
-
-        # mixer blocks
+        # mixer blocks (保持不变)
         self.mixer1 = nn.Sequential(
             nn.Conv2d(outch3 + 2 * in_channels[1] + 2 * in_channels[0], outch3, (3, 3), padding=(1, 1), bias=True),
             nn.ReLU(),
             nn.Conv2d(outch3, outch2, (3, 3), padding=(1, 1), bias=True),
             nn.ReLU())
-
         self.mixer2 = nn.Sequential(nn.Conv2d(outch2, outch2, (3, 3), padding=(1, 1), bias=True),
                                     nn.ReLU(),
                                     nn.Conv2d(outch2, outch1, (3, 3), padding=(1, 1), bias=True),
                                     nn.ReLU())
-
         self.mixer3 = nn.Sequential(nn.Conv2d(outch1, outch1, (3, 3), padding=(1, 1), bias=True),
                                     nn.ReLU(),
                                     nn.Conv2d(outch1, 2, (3, 3), padding=(1, 1), bias=True))
 
     def forward(self, query_feats, support_feats, support_mask, nshot=1):
-        if self.use_mmscope:
-            # ✅ 增强 query 特征 (每个 stage 独立)
-            enhanced_query_feats = []
-            for i, feat in enumerate(query_feats):
-                # feat: [B, C, H, W]
-                enhanced = self.mmscope_modules[i](feat)
-                enhanced_query_feats.append(enhanced)
-
-            # ✅ 增强 support 特征 (每个 stage 独立)
-            enhanced_support_feats = []
-            for i, feat in enumerate(support_feats):
-                B, n_shot, C, H, W = feat.shape
-                # reshape to [B*n_shot, C, H, W]
-                feat_flat = feat.view(B * n_shot, C, H, W)
-                enhanced_flat = self.mmscope_modules[i](feat_flat)
-                # reshape back
-                enhanced = enhanced_flat.view(B, n_shot, C, H, W)
-                enhanced_support_feats.append(enhanced)
-
-            query_feats = enhanced_query_feats
-            support_feats = enhanced_support_feats
         coarse_masks = []
         for idx, query_feat in enumerate(query_feats):
             # 1/4 scale feature only used in skip connect
@@ -480,19 +484,19 @@ class DCAMA_model(nn.Module):
         coarse_masks2 = self.conv2(coarse_masks2)
         coarse_masks3 = self.conv3(coarse_masks3)
 
-        # multi-scale cascade (pixel-wise addition)
-        coarse_masks1 = F.interpolate(coarse_masks1, coarse_masks2.size()[-2:], mode='bilinear', align_corners=True)
-        # mix = coarse_masks1 + coarse_masks2
-        # ✅ [第3步 A] 使用第一个门控单元，智能融合1/16和1/32尺度的特征
-        mix = self.fusion_gate1(high_res_feat=coarse_masks2, low_res_feat=coarse_masks1)
-        mix = self.conv4(mix)
+        if not (self.use_mmscope):
+            # --- 方案A: 运行 DCAMA 原始的门控融合 (SpatialGatingUnit) ---
+            coarse_masks1_interp = F.interpolate(coarse_masks1, coarse_masks2.size()[-2:], mode='bilinear', align_corners=True)
+            mix = self.fusion_gate1(high_res_feat=coarse_masks2, low_res_feat=coarse_masks1_interp)
+            mix = self.conv4(mix)
 
-        mix = F.interpolate(mix, coarse_masks3.size()[-2:], mode='bilinear', align_corners=True)
-        # mix = mix + coarse_masks3
-        # ✅ [第3步 B] 使用第二个门控单元，智能融合之前的结果和1/8尺度的特征
-        # 这里的 high_res_feat 是 coarse_masks3, low_res_feat 是 mix_interp
-        mix = self.fusion_gate2(high_res_feat=coarse_masks3, low_res_feat=mix)
-        mix = self.conv5(mix)
+            mix_interp = F.interpolate(mix, coarse_masks3.size()[-2:], mode='bilinear', align_corners=True)
+            mix = self.fusion_gate2(high_res_feat=coarse_masks3, low_res_feat=mix_interp)
+            mix = self.conv5(mix)
+        
+        else:
+            # --- 方案B: 运行 MMSCopE 的 Mamba 融合 ---
+            mix = self.mmscope_decoder(x_8=coarse_masks3, x_16=coarse_masks2, x_32=coarse_masks1)
 
         # skip connect 1/8 and 1/4 features (concatenation)
         if nshot == 1:

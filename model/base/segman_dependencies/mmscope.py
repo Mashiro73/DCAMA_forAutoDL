@@ -1,5 +1,5 @@
 # 文件路径: model/base/segman_dependencies/mmscope.py
-# 代码逻辑来源: 提取并改编自 segman_decoder.py 中的 SegMANHead
+# 方案三 (最终修复版)：将 MMSCopE 重构为通用的三尺度融合解码器
 
 import torch
 import torch.nn as nn
@@ -13,113 +13,103 @@ resize = F.interpolate
 
 class MMSCopE(nn.Module):
     """
-    Modular Mamba-based Multi-Scale Context Extraction Module.
-    Extracted and adapted from SegMANHead for plug-and-play use.
-    Replaces mmcv.ConvModule with standard nn.Sequential.
+    MMSCopE (Mamba-based Multi-Scale Context Extraction) 解码器模块。
+    
+    此版本被修改为接收来自 DCAMA 的三个不同尺度的粗略掩码 (1/8, 1/16, 1/32)，
+    使用 VSSM (Mamba) 进行融合，并输出 1/8 尺度的精炼特征图。
     """
     def __init__(self, embed_dim, norm_layer=LayerNorm2d, act_layer=nn.GELU):
-        super().__init__()
-        self.embed_dim = embed_dim
-        # SegMAN 源码中 reduce_channels 输出通道是 C//2
-        intermediate_dim = embed_dim // 2
-        if intermediate_dim == 0:
-             intermediate_dim = embed_dim # 防止 embed_dim=1 时出错
-
-        # --- 1. 定义生成多尺度上下文的卷积层 (替换 ConvModule) ---
-        self.conv_s2 = nn.Sequential(
-            nn.Conv2d(embed_dim, embed_dim, kernel_size=3, stride=2, padding=1),
-            norm_layer(embed_dim),
-            act_layer()
-        )
-        # 遵循 segman_decoder.py 源码的 stride=2 实现，输入为 s2
-        self.conv_s4 = nn.Sequential(
-             nn.Conv2d(embed_dim, embed_dim, kernel_size=5, stride=2, padding=2),
-             norm_layer(embed_dim),
-             act_layer()
-        )
-
-        # --- 2. 定义 PixelUnshuffle ---
-        # 目标统一到 H/32 x W/32 (基于 conv_s4 的输出尺度)
-        self.unshuffle_f = nn.PixelUnshuffle(4)  # x (H/8) -> H/32, C*16
-        self.unshuffle_s2 = nn.PixelUnshuffle(2) # s2 (H/16) -> H/32, C*4
-        # s4 (H/32) 无需 unshuffle
-
-        # --- 3. 定义通道投影卷积 (替换 ConvModule) ---
-        # 索引匹配 SegMAN 源码：[0] for s4, [1] for s2, [2] for x
-        self.reduce_channels = nn.ModuleList([
-             nn.Sequential( # for s4_unshuffled (input C)
-                 nn.Conv2d(embed_dim, intermediate_dim, kernel_size=1),
-                 norm_layer(intermediate_dim), act_layer()
-             ),
-             nn.Sequential( # for s2_unshuffled (input C*4)
-                 nn.Conv2d(embed_dim * 4, intermediate_dim, kernel_size=1),
-                 norm_layer(intermediate_dim), act_layer()
-             ),
-             nn.Sequential( # for f_unshuffled (input C*16)
-                 nn.Conv2d(embed_dim * 16, intermediate_dim, kernel_size=1),
-                 norm_layer(intermediate_dim), act_layer()
-             )
-        ])
-
-        # --- 4. 实例化 Mamba 扫描模块 (VSSM) ---
-        # 输入通道为 3 * intermediate_dim
-        # 确保传入 use_triton 等参数（如果 vssm_utils.py 中的 VSSM 支持）
-        self.vssm = VSSM(d_model=intermediate_dim * 3)
-
-        # --- 5. 定义上采样和输出投影层 (替换 ConvModule) ---
-        # SegMAN 源码直接 resize + proj_out
-        self.proj_out = nn.Sequential(
-            # 输入通道是 VSSM 输出的 3 * intermediate_dim
-            nn.Conv2d(intermediate_dim * 3, embed_dim, kernel_size=1)
-            # 输出投影后通常不接 Norm 和 Act
-        )
-
-        # --- 6. 定义输出归一化 (可选) ---
-        self.norm_out = norm_layer(embed_dim)
-
-    def forward(self, x):
         """
         Args:
-            x (torch.Tensor): Input feature map, expected to be at 1/8 scale.
-                              Shape: [B, C, H, W], where C = self.embed_dim.
-        Returns:
-            torch.Tensor: Refined feature map with the same shape as input.
+            embed_dim (int): 融合模块的内部通道维度。
+                             在 DCAMA 中，这将是 `outch3` (例如 128)。
         """
-        B, C, H, W = x.shape
-        if C != self.embed_dim:
-            raise ValueError(f"Input channel dimension ({C}) does not match MMSCopE embed_dim ({self.embed_dim})")
+        super().__init__()
+        self.embed_dim = embed_dim
+        intermediate_dim = self.embed_dim
 
-        # 1. 生成多尺度上下文表示
-        s2 = self.conv_s2(x)  # [B, C, H/2, W/2] = 1/16 scale
-        s4 = self.conv_s4(s2) # [B, C, H/4, W/4] = 1/32 scale (根据源码)
+        # --- 1. 定义 PixelUnshuffle 操作 ---
+        self.unshuffle_f = nn.PixelUnshuffle(4)
+        self.unshuffle_s2 = nn.PixelUnshuffle(2)
 
-        # 2. Pixel Unshuffle 到 H/32 x W/32
-        x_unshuffled = self.unshuffle_f(x)     # [B, C*16, H/4, W/4]
-        s2_unshuffled = self.unshuffle_s2(s2)  # [B, C*4,  H/4, W/4]
-        s4_unshuffled = s4                     # [B, C,    H/4, W/4]
+        # --- 2. 定义三个尺度的通道投影器 ---
+        self.reduce_channels = nn.ModuleList([
+            # [0] 用于 1/8 (unshuffled, C*16) -> intermediate_dim
+            nn.Sequential(
+                nn.Conv2d(self.embed_dim * 16, intermediate_dim, kernel_size=1),
+                norm_layer(intermediate_dim), act_layer()
+            ),
+            # [1] 用于 1/16 (unshuffled, C*4) -> intermediate_dim
+            nn.Sequential(
+                nn.Conv2d(self.embed_dim * 4, intermediate_dim, kernel_size=1),
+                norm_layer(intermediate_dim), act_layer()
+            ),
+            # [2] 用于 1/32 (C) -> intermediate_dim
+            nn.Sequential(
+                nn.Conv2d(self.embed_dim, intermediate_dim, kernel_size=1),
+                norm_layer(intermediate_dim), act_layer()
+            )
+        ])
 
-        # 3. 通道投影 (映射到 intermediate_dim)
-        # 索引调整: [0] for s4, [1] for s2, [2] for x
-        f_proj  = self.reduce_channels[2](x_unshuffled)     # [B, C//2, H/4, W/4]
-        s2_proj = self.reduce_channels[1](s2_unshuffled)    # [B, C//2, H/4, W/4]
-        s4_proj = self.reduce_channels[0](s4_unshuffled)    # [B, C//2, H/4, W/4]
+        # --- 3. VSSM (Mamba) 模块 ---
+        # 输入通道为 3 * intermediate_dim (三个尺度拼接后)
+        self.vssm = VSSM(d_model=intermediate_dim * 3)
 
-        # 4. 拼接
-        concat_feat = torch.cat([f_proj, s2_proj, s4_proj], dim=1) # [B, 3*(C//2), H/4, W/4]
+        # --- 4. 输出投影 ---
+        # 输入通道 (intermediate_dim * 3) 必须与 VSSM 的 d_model 匹配
+        # 输出通道为 embed_dim (128)
+        self.proj_out = nn.Sequential(
+            nn.Conv2d(intermediate_dim * 3, self.embed_dim, kernel_size=1)
+        )
+        self.norm_out = norm_layer(self.embed_dim)
 
-        # 5. Mamba 扫描 (VSSM)
-        fused_feat = self.vssm(concat_feat) # 输出也是 [B, 3*(C//2), H/4, W/4]
+    def forward(self, x_8, x_16, x_32):
+        """
+        Args:
+            x_8 (torch.Tensor): 1/8 尺度的粗略掩码 (来自 conv3)
+                                Shape: [B, C, H, W]
+            x_16 (torch.Tensor): 1/16 尺度的粗略掩码 (来自 conv2)
+                                 Shape: [B, C, H/2, W/2]
+            x_32 (torch.Tensor): 1/32 尺度的粗略掩码 (来自 conv1)
+                                 Shape: [B, C, H/4, W/4]
+        Returns:
+            torch.Tensor: Mamba 融合后的特征图，恢复到 1/8 尺度
+                          Shape: [B, C, H, W]
+        """
+        # 1. Pixel Unshuffle：全部统一到 1/32 尺度
+        x_unshuffled = self.unshuffle_f(x_8)
+        s2_unshuffled = self.unshuffle_s2(x_16)
+        s4_unshuffled = x_32
 
-        # 6. 恢复到 1/8 尺度 (使用 resize, 遵循源码)
-        fused_feat_up = resize(fused_feat,
-                               size=(H, W), # 恢复到 1/8 尺度 H, W
-                               mode='bilinear',
-                               align_corners=False) # 通常 align_corners=False for features
+        # 2. 通道投影
+        x_reduced = self.reduce_channels[0](x_unshuffled)
+        s2_reduced = self.reduce_channels[1](s2_unshuffled)
+        s4_reduced = self.reduce_channels[2](s4_unshuffled)
 
-        # 7. 输出投影
-        out_feat = self.proj_out(fused_feat_up) # [B, C, H, W]
+        # 3. 拼接 (Concatenate)
+        # (B, 3 * C_inter, H/4, W/4)
+        x_concat = torch.cat([x_reduced, s2_reduced, s4_reduced], dim=1)
+        
+        # ✅ [关键修复] -----------------------------------------------
+        # 3.5 获取 4D 形状，VSSM 会将其压缩为 3D
+        B, C_concat, H_prime, W_prime = x_concat.shape
 
-        # 8. 输出归一化 (可选)
-        out_feat = self.norm_out(out_feat)
+        # 4. VSSM (Mamba) 扫描
+        # 输入是 4D: [B, C_concat, H', W']
+        # VSSM.forward 的输出是 3D: [B, C_concat, L']  (其中 L' = H' * W')
+        x_vssm_3d = self.vssm(x_concat) 
 
-        return out_feat
+        # 4.5 [关键修复] 将 3D 输出 reshape 回 4D，以便 Conv2d (proj_out) 可以处理
+        # (B, C_concat, L') -> (B, C_concat, H', W')
+        x_vssm_4d = x_vssm_3d.view(B, C_concat, H_prime, W_prime)
+        # --------------------------------------------------------
+
+        # 5. 输出投影
+        # (B, C_embed, H/4, W/4)
+        x_proj = self.norm_out(self.proj_out(x_vssm_4d))
+
+        # 6. 恢复尺度：将融合后的特征图上采样回 1/8 尺度
+        # (B, C_embed, H, W)
+        x_out = resize(x_proj, size=x_8.shape[-2:], mode='bilinear', align_corners=False)
+        
+        return x_out

@@ -24,6 +24,7 @@ def parse_opts():
     parser.add_argument('--local_rank', default=0, type=int, help='node rank for distributed training')
     parser.add_argument('--finetune_backbone', action='store_true',
                         help='If set, the backbone network will be un-frozen and fine-tuned.')
+    parser.add_argument('--use_amp', action='store_true', help='Enable Automatic Mixed Precision training')
 
     # for test
     parser.add_argument('--load', type=str, default='')

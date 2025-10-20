@@ -12,7 +12,7 @@ from data.dataset import FSSDataset
 from torch.cuda.amp import GradScaler, autocast
 
 
-def train(epoch, model, dataloader, optimizer, training, scaler):
+def train(epoch, model, dataloader, optimizer, training, scaler,use_amp=True):
     r""" Train """
 
     # Force randomness during training / freeze randomness during testing
@@ -24,31 +24,50 @@ def train(epoch, model, dataloader, optimizer, training, scaler):
 
         # 1. forward pass
         batch = utils.to_cuda(batch)
-        with autocast(enabled=True):
-            logit_mask = model(batch['query_img'], batch['support_imgs'].squeeze(1), batch['support_masks'].squeeze(1))
-            loss = model.module.compute_objective(logit_mask, batch['query_mask'])
+               # ✅ 动态选择是否使用 autocast
+        # if use_amp:
+        #     with torch.cuda.amp.autocast():
+        #         logit_mask = model(
+        #             batch['query_img'], 
+        #             batch['support_imgs'].squeeze(1), 
+        #             batch['support_masks'].squeeze(1)
+        #         )
+        #         loss = model.module.compute_objective(logit_mask, batch['query_mask'])
+        # else:
+        #     logit_mask = model(
+        #         batch['query_img'], 
+        #         batch['support_imgs'].squeeze(1), 
+        #         batch['support_masks'].squeeze(1)
+        #     )
+            #loss = model.module.compute_objective(logit_mask, batch['query_mask'])
+        logit_mask = model(
+        batch['query_img'], 
+        batch['support_imgs'].squeeze(1), 
+        batch['support_masks'].squeeze(1)
+        )
+        loss = model.module.compute_objective(logit_mask, batch['query_mask'])
 
         pred_mask = logit_mask.argmax(dim=1)
 
         # 2. Compute loss & update model parameters
 
         if training:
-            optimizer.zero_grad()
-            # scaler.scale(loss) 会先将 loss 放大
-            scaler.scale(loss).backward()
+                optimizer.zero_grad()
+                # if use_amp:
+                #     scaler.scale(loss).backward()
+                #     scaler.step(optimizer)
+                #     scaler.update()
+                # else:
+                #     loss.backward()
+                #     optimizer.step()
 
-            # scaler.step(optimizer) 会先将梯度缩回，然后执行优化器更新
-            scaler.step(optimizer)
-
-            # scaler.update() 更新缩放因子，为下一次迭代做准备
-            scaler.update()
-            # loss.backward()
-            # optimizer.step()
+                loss.backward()
+                optimizer.step()
 
         # 3. Evaluate prediction
         area_inter, area_union = Evaluator.classify_prediction(pred_mask, batch)
         average_meter.update(area_inter, area_union, batch['class_id'], loss.detach().clone())
-        average_meter.write_process(idx, len(dataloader), epoch, write_batch_idx=50)
+        average_meter.write_process(idx, len(dataloader), epoch, write_batch_idx=10)
 
     # Write evaluation results
     average_meter.write_result('Training' if training else 'Validation', epoch)
@@ -62,13 +81,25 @@ if __name__ == '__main__':
 
     # Arguments parsing
     args = parse_opts()
+        # ✅ 智能判断：如果 backbone 是 segman，则禁用 AMP（除非用户强制启用）
+    # if args.backbone == 'segman' or args.backbone == 'swin':
+    #     if args.use_amp:
+    #         Logger.info("⚠️  Warning: segman/swin + MMSCopE may not support AMP. Proceed at your own risk.")
+    #         print("⚠️  Warning: segman/swin + MMSCopE may not support AMP. Proceed at your own risk.")
+    #     else:
+    #         Logger.info("🔒 Disabling AMP for segman backbone (MMSCopE/VSSM compatibility).")
+    #         args.use_amp = False
+    # else:
+    #     Logger.info(f"{'✅ Enabling' if args.use_amp else '❌ Disabling'} AMP for {args.backbone} backbone.")
+    #     print(f"{'✅ Enabling' if args.use_amp else '❌ Disabling'} AMP for {args.backbone} backbone.")
 
     # ddp backend initialization
     # torch.distributed.init_process_group(backend='nccl')
     # torch.cuda.set_device(args.local_rank)
 
     # Model initialization
-    model = DCAMA(args.backbone, args.feature_extractor_path, False)
+    model = DCAMA(args.backbone, args.feature_extractor_path, False,use_mmscope=(args.backbone == 'segman'))
+    model = model.float()# ✅ 关键：强制 float32记住改为swinv2时删除
     # device = torch.device("cuda", args.local_rank)
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     model.to(device)
@@ -78,8 +109,16 @@ if __name__ == '__main__':
     # Helper classes (for training) initialization
     # optimizer = optim.SGD([{"params": model.parameters(), "lr": args.lr,
     #                         "momentum": 0.9, "weight_decay": args.lr/10, "nesterov": True}])
-    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.05)
-    scaler = GradScaler(enabled=True)
+    # optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.05)
+    # scaler = GradScaler(enabled=True)
+    if args.use_amp:
+        optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.05)
+        scaler = GradScaler()
+    else:
+        # 强制模型为 float32（防止之前有 half()）
+        model = model.float()
+        optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.05)
+        scaler = None  # 不使用 scaler
     Evaluator.initialize()
     # if args.local_rank == 0:
     #     Logger.initialize(args, training=True)
